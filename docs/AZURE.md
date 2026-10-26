@@ -49,7 +49,7 @@ export AZURE_DEVOPS_EXT_PAT=xxxxxxxx...
 
 Remotes like `https://tfs.example.com/DefaultCollection/Project/_git/repo` and
 `ssh://tfs.example.com/DefaultCollection/Project/_git/repo` are then detected, and PRs
-open by id or full URL as above. The collection stays in the API path
+open by id or full URL as shown below. The collection stays in the API path
 (`https://host/{collection}/{project}/_apis/...`) and requests use `api-version=7.1`, so
 the server must be Azure DevOps Server 2022.1 or newer. The API is always called over
 HTTPS on the default port.
@@ -69,14 +69,6 @@ tuicr pr https://dev.azure.com/org/project/_git/repo/pullrequest/125   # by URL
 
 `*.visualstudio.com` URLs work too and are normalized to `dev.azure.com` internally.
 
-If the PR's base or source commits aren't in your clone yet, tuicr runs `git fetch` for you
-(the missing commits first, then a plain fetch of the matching remote, never prompting for
-credentials). If that fails, it reports the diff error and you can fetch manually.
-Automatic fetches disable credential helpers and askpass programs, and use OpenSSH
-in batch mode with strict host-key checking instead of custom Git SSH commands.
-SSH config identities and host aliases still apply. If authentication requires a
-prompt or a custom SSH wrapper, fetch manually first.
-
 Inside tuicr, review as usual (`j`/`k` to move, `c` to comment, `v` for a range comment),
 then `:submit` to push:
 
@@ -95,7 +87,9 @@ threads. `az`/system threads (pushes, policy, votes) are filtered out.
 Azure DevOps exposes no single "unified diff" endpoint, so tuicr builds the PR diff from a
 local clone with `git diff <base>...<head>`. Run tuicr from a checkout of the repo, and make
 sure the PR's base and source commits are fetched (`git fetch origin`). If they aren't
-present locally, tuicr will tell you to fetch and retry.
+present locally, tuicr will tell you to fetch and retry. Neither cloud nor self-hosted
+Azure adds an explicit fetch step when opening or refreshing a PR. Git's existing
+partial-clone lazy-fetch behavior is unchanged.
 
 File content for context expansion is read from the local clone first, falling back to the
 REST API when a revision isn't present locally.
@@ -107,8 +101,9 @@ This is the first Azure DevOps slice. Not yet supported:
 - **Commit-subrange selection** requires both commits to be present in the local clone.
 - **Draft reviews** — Azure DevOps has no draft-review primitive, so `:submit draft` behaves
   like Comment and posts immediately.
-- **Azure DevOps Server (on-prem)** — only the cloud (`dev.azure.com` / `*.visualstudio.com`)
-  is targeted.
+- **Older on-premises servers** — REST API 7.1 requires Azure DevOps Server 2022.1
+  or newer. API requests use HTTPS on the default port; custom API ports and
+  HTTP-only servers are not supported.
 
 ## Troubleshooting
 

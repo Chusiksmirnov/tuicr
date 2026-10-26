@@ -242,92 +242,6 @@ fn default_transport() -> Box<dyn AzHttp> {
 
 // ---------- Local git helpers (mirror gh/glab) ----------
 
-fn has_commit(repo_root: &Path, sha: &str) -> bool {
-    run_command_output(
-        "git",
-        Some(repo_root),
-        ["cat-file", "-e", sha].iter().map(|s| OsStr::new(*s)),
-    )
-    .is_ok()
-}
-
-/// Name of the remote in `repo_root` whose URL points at `repo`.
-fn matching_remote(repo_root: &Path, repo: &ForgeRepository) -> Option<String> {
-    let names = run_command_output("git", Some(repo_root), ["remote"]).ok()?;
-    names
-        .lines()
-        .map(str::trim)
-        .filter(|name| !name.is_empty())
-        .find(|name| {
-            run_command_output("git", Some(repo_root), ["remote", "get-url", "--", name])
-                .ok()
-                .and_then(|url| parse_azure_remote_url(url.trim()))
-                .as_ref()
-                == Some(repo)
-        })
-        .map(str::to_string)
-}
-
-/// Automatic fetches deliberately use OpenSSH rather than a custom Git SSH
-/// command so wrappers cannot re-enable interactive authentication. Normal
-/// ~/.ssh/config settings (including identities and host aliases) still apply.
-fn git_fetch_command(repo_root: &Path, args: &[&str]) -> std::process::Command {
-    let mut command = std::process::Command::new("git");
-    command
-        .current_dir(repo_root)
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .env("GIT_ASKPASS", "")
-        .env("SSH_ASKPASS", "")
-        .env("SSH_ASKPASS_REQUIRE", "never")
-        .env("GCM_INTERACTIVE", "Never")
-        .env(
-            "GIT_SSH_COMMAND",
-            "ssh -oBatchMode=yes -oStrictHostKeyChecking=yes",
-        )
-        .env("GIT_SSH_VARIANT", "ssh")
-        .args([
-            "-c",
-            "credential.helper=",
-            "-c",
-            "credential.interactive=false",
-        ])
-        .args(["fetch", "--quiet"])
-        .args(args)
-        .stdin(std::process::Stdio::null());
-    command
-}
-
-/// Run `git fetch` without prompting for credentials.
-fn git_fetch(repo_root: &Path, args: &[&str]) -> bool {
-    git_fetch_command(repo_root, args)
-        .output()
-        .is_ok_and(|out| out.status.success())
-}
-
-/// Best-effort: make `shas` present in the checkout. Fetches only the missing
-/// commits from the remote matching `repo` (touching no refs), then falls back
-/// to a plain `git fetch` of that remote. Failures are left for the caller's
-/// diff error to report.
-fn fetch_missing_commits(repo_root: &Path, repo: &ForgeRepository, shas: &[&str]) {
-    let missing: Vec<&str> = shas
-        .iter()
-        .copied()
-        .filter(|sha| !has_commit(repo_root, sha))
-        .collect();
-    if missing.is_empty() {
-        return;
-    }
-    let Some(remote) = matching_remote(repo_root, repo) else {
-        return;
-    };
-    let mut args = vec![remote.as_str()];
-    args.extend(&missing);
-    if git_fetch(repo_root, &args) && missing.iter().all(|sha| has_commit(repo_root, sha)) {
-        return;
-    }
-    git_fetch(repo_root, &[remote.as_str()]);
-}
-
 /// `git diff <a><sep><b>` in `repo_root`, returning `None` when either SHA is
 /// absent locally or the command fails.
 fn local_diff(repo_root: &Path, a: &str, b: &str, sep: &str) -> Option<Vec<FilePatch>> {
@@ -567,7 +481,6 @@ impl ForgeBackend for AzureDevOpsBackend {
             .local_checkout
             .as_deref()
             .ok_or_else(missing_checkout)?;
-        fetch_missing_commits(root, &pr.repository, &[&pr.base_sha, &pr.head_sha]);
         local_diff(root, &pr.base_sha, &pr.head_sha, "...").ok_or_else(|| {
             TuicrError::Forge(format!(
                 "Could not diff {}...{} in the local checkout. Fetch the PR's base and source \
@@ -580,7 +493,7 @@ impl ForgeBackend for AzureDevOpsBackend {
 
     fn get_pull_request_commit_range_diff(
         &self,
-        pr: &PullRequestDetails,
+        _pr: &PullRequestDetails,
         start_sha: &str,
         end_sha: &str,
     ) -> Result<Vec<FilePatch>> {
@@ -588,7 +501,6 @@ impl ForgeBackend for AzureDevOpsBackend {
             .local_checkout
             .as_deref()
             .ok_or_else(missing_checkout)?;
-        fetch_missing_commits(root, &pr.repository, &[start_sha, end_sha]);
         local_diff(root, start_sha, end_sha, "..").ok_or_else(|| {
             TuicrError::UnsupportedOperation(
                 "Commit-range diff requires both commits in the local checkout for Azure DevOps"
@@ -603,7 +515,6 @@ impl ForgeBackend for AzureDevOpsBackend {
         // is three-dot, so the old side lives at the merge base. Azure already
         // requires a local checkout for diffing, so this needs no API call.
         let root = self.local_checkout.as_deref()?;
-        fetch_missing_commits(root, &pr.repository, &[&pr.base_sha, &pr.head_sha]);
         local_merge_base(root, &pr.base_sha, &pr.head_sha)
     }
 
@@ -1087,41 +998,6 @@ mod tests {
         let repo =
             parse_azure_remote_url("https://dev.azure.com/myorg/myproject/_git/myrepo").unwrap();
         assert_eq!(repo, azure_repo());
-    }
-
-    #[test]
-    fn automatic_fetch_disables_interactive_authentication() {
-        let command = git_fetch_command(Path::new("."), &["origin", "abc123"]);
-        let env: std::collections::HashMap<_, _> = command.get_envs().collect();
-        for (key, value) in [
-            ("GIT_TERMINAL_PROMPT", "0"),
-            ("GIT_ASKPASS", ""),
-            ("SSH_ASKPASS", ""),
-            ("SSH_ASKPASS_REQUIRE", "never"),
-            ("GCM_INTERACTIVE", "Never"),
-            (
-                "GIT_SSH_COMMAND",
-                "ssh -oBatchMode=yes -oStrictHostKeyChecking=yes",
-            ),
-            ("GIT_SSH_VARIANT", "ssh"),
-        ] {
-            assert_eq!(env.get(OsStr::new(key)), Some(&Some(OsStr::new(value))));
-        }
-        let args: Vec<_> = command.get_args().collect();
-        assert_eq!(
-            args,
-            [
-                "-c",
-                "credential.helper=",
-                "-c",
-                "credential.interactive=false",
-                "fetch",
-                "--quiet",
-                "origin",
-                "abc123"
-            ]
-            .map(OsStr::new)
-        );
     }
 
     fn tfs_repo(owner: &str, name: &str) -> ForgeRepository {
